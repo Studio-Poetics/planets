@@ -1,0 +1,1587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planet Orbit Experience - Hand Tracking</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; }
+        canvas { display: block; }
+
+        /* Video preview in corner */
+        #video-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 200px;
+            height: 150px;
+            border: 2px solid #333;
+            border-radius: 10px;
+            overflow: hidden;
+            z-index: 100;
+        }
+
+        #webcam {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* Mirror the video */
+        }
+
+        /* Hand cursor indicator */
+        #hand-cursor {
+            position: fixed;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1000;
+            transform: translate(-50%, -50%);
+            transition: background-color 0.2s, transform 0.1s;
+        }
+
+        #hand-cursor.open {
+            background: radial-gradient(circle, rgba(0, 255, 0, 0.6) 0%, rgba(0, 255, 0, 0.2) 70%, transparent 100%);
+            border: 2px solid rgba(0, 255, 0, 0.8);
+        }
+
+        #hand-cursor.closed {
+            background: radial-gradient(circle, rgba(255, 100, 0, 0.8) 0%, rgba(255, 100, 0, 0.3) 70%, transparent 100%);
+            border: 2px solid rgba(255, 100, 0, 1);
+            transform: translate(-50%, -50%) scale(0.8);
+        }
+
+        #hand-cursor.no-hand {
+            background: radial-gradient(circle, rgba(100, 100, 100, 0.3) 0%, transparent 70%);
+            border: 2px dashed rgba(100, 100, 100, 0.5);
+        }
+
+        /* Gesture indicator */
+        #gesture-indicator {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 16px;
+            border-radius: 20px;
+            z-index: 100;
+        }
+
+        /* Loading overlay */
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+            color: #fff;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        #loading-overlay.hidden {
+            display: none;
+        }
+
+        .loading-spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #333;
+            border-top-color: #0f0;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Loading overlay -->
+    <div id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div>Initializing Hand Tracking...</div>
+    </div>
+
+    <!-- Video preview -->
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline></video>
+    </div>
+
+    <!-- Hand cursor -->
+    <div id="hand-cursor" class="no-hand"></div>
+
+    <!-- Gesture indicator -->
+    <div id="gesture-indicator">Waiting for hand...</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <!-- MediaPipe Dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // ============================================
+        // CONFIGURATION
+        // ============================================
+        const CONFIG = {
+            // 9 Orbit radii - Mercury to Pluto (configurable)
+            orbitRadii: [3, 4.2, 5.4, 6.6, 8.5, 10.5, 12.5, 14.5, 16],
+
+            // Orbit names for reference
+            orbitNames: ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto'],
+
+            // Detection threshold for snapping
+            orbitSnapThreshold: 0.8,
+
+            // Revolution speeds (radians per second) - outer planets slower
+            orbitSpeeds: [0.8, 0.6, 0.5, 0.4, 0.25, 0.18, 0.12, 0.08, 0.05],
+
+            // Drag plane Z position
+            dragPlaneZ: 0,
+
+            // Disintegration animation duration (ms)
+            disintegrationDuration: 1500,
+
+            // Particle count for disintegration
+            particleCount: 50,
+
+            // Sidebar position for planets (horizontal on top)
+            sidebarY: 10,
+
+            // Hand tracking settings
+            handTracking: {
+                fistThreshold: 0.7,
+                positionSmoothing: 0.3,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.5
+            }
+        };
+
+        // ============================================
+        // DOM ELEMENTS
+        // ============================================
+        const videoElement = document.getElementById('webcam');
+        const handCursor = document.getElementById('hand-cursor');
+        const gestureIndicator = document.getElementById('gesture-indicator');
+        const loadingOverlay = document.getElementById('loading-overlay');
+
+        // ============================================
+        // HAND TRACKING STATE
+        // ============================================
+
+        /**
+         * Hand gesture states
+         * - OPEN_PALM: Hand is open, used for moving cursor
+         * - CLOSED_FIST: Hand is closed, used for grabbing/dragging
+         * - NO_HAND: No hand detected
+         */
+        const GESTURE = {
+            OPEN_PALM: 'open_palm',
+            CLOSED_FIST: 'closed_fist',
+            NO_HAND: 'no_hand'
+        };
+
+        let currentGesture = GESTURE.NO_HAND;
+        let previousGesture = GESTURE.NO_HAND;
+
+        // Smoothed hand position (normalized 0-1)
+        let smoothedHandPosition = { x: 0.5, y: 0.5 };
+
+        // Raw hand position for reference
+        let rawHandPosition = { x: 0.5, y: 0.5 };
+
+        // Flag to track if we just transitioned to fist
+        let justGrabbedPlanet = false;
+
+        // ============================================
+        // SCENE SETUP
+        // ============================================
+        const scene = new THREE.Scene();
+
+        // Video background for sky effect at 30% opacity
+        const video = document.createElement('video');
+        video.src = './background_sky.mp4';
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.autoplay = true;
+        video.play();
+
+        const videoTexture = new THREE.VideoTexture(video);
+        videoTexture.minFilter = THREE.LinearFilter;
+        videoTexture.magFilter = THREE.LinearFilter;
+        videoTexture.colorSpace = THREE.SRGBColorSpace;
+
+        // Create a dark base background
+        scene.background = new THREE.Color(0x020208);
+
+        // Add video as a background plane with 30% opacity
+        const bgGeometry = new THREE.PlaneGeometry(100, 60);
+        const bgMaterial = new THREE.MeshBasicMaterial({
+            map: videoTexture,
+            transparent: true,
+            opacity: 0.3
+        });
+        const bgPlane = new THREE.Mesh(bgGeometry, bgMaterial);
+        bgPlane.position.set(0, 0, -40);
+        scene.add(bgPlane);
+
+        const camera = new THREE.PerspectiveCamera(
+            55,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+        camera.position.set(0, 10, 18);
+        camera.lookAt(0, 2, 0);
+
+        // Store initial camera state for reset
+        const initialCameraPos = camera.position.clone();
+        const initialCameraLookAt = new THREE.Vector3(0, 2, 0);
+
+        // Camera sees both layers (0 = sidebar/ambient, 1 = orbit/sunlit)
+        camera.layers.enable(0);
+        camera.layers.enable(1);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+
+        // Fix texture color space - critical for correct texture appearance
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.NoToneMapping;
+
+        document.body.appendChild(renderer.domElement);
+
+        // ============================================
+        // LIGHTING
+        // ============================================
+        // Ambient/omni light - affects all layers (sidebar and orbit)
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        ambientLight.layers.enableAll();
+        scene.add(ambientLight);
+
+        // Extra bright light for sidebar only (layer 0) - from front
+        const sidebarLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        sidebarLight.position.set(0, 15, 25);
+        sidebarLight.layers.set(0);  // Only affects sidebar planets
+        scene.add(sidebarLight);
+
+        // Additional fill light for sidebar from above
+        const sidebarFillLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        sidebarFillLight.position.set(0, 20, -10);
+        sidebarFillLight.layers.set(0);
+        scene.add(sidebarFillLight);
+
+        // Sun mesh will be created after texture loads
+        let sun = null;
+
+        // Sun as the primary light source - PointLight at center
+        // Only affects objects on layer 1 (orbit area)
+        const sunLight = new THREE.PointLight(0xffffff, 150, 200, 1.5);
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 1024;
+        sunLight.shadow.mapSize.height = 1024;
+        sunLight.position.set(0, 0, 0);
+        sunLight.layers.set(1);  // Sun light only affects layer 1
+        scene.add(sunLight);
+
+        // ============================================
+        // ORBIT RINGS
+        // ============================================
+
+        const orbitRings = [];
+
+        /**
+         * Creates a torus ring to represent an orbit path
+         * @param {number} radius - Orbit radius
+         * @param {number} index - Orbit index (0-8)
+         * @returns {THREE.Mesh} The orbit ring mesh
+         */
+        function createOrbitRing(radius, index) {
+            const geometry = new THREE.TorusGeometry(radius, 0.03, 16, 100);
+            const material = new THREE.MeshBasicMaterial({
+                color: 0x4488aa,
+                transparent: true,
+                opacity: 0.4
+            });
+            const ring = new THREE.Mesh(geometry, material);
+            ring.rotation.x = Math.PI / 2; // Lay flat on XZ plane
+            ring.userData.orbitIndex = index;
+            ring.userData.defaultOpacity = 0.4;
+            return ring;
+        }
+
+        // Create all 9 orbit rings
+        CONFIG.orbitRadii.forEach((radius, index) => {
+            const ring = createOrbitRing(radius, index);
+            scene.add(ring);
+            orbitRings.push(ring);
+        });
+
+        // ============================================
+        // SIDEBAR PANEL (horizontal bar on top)
+        // ============================================
+        const sidebarGeometry = new THREE.PlaneGeometry(36, 4);
+        const sidebarMaterial = new THREE.MeshBasicMaterial({
+            color: 0x050510,
+            transparent: true,
+            opacity: 0.5,
+            side: THREE.DoubleSide
+        });
+        const sidebarPanel = new THREE.Mesh(sidebarGeometry, sidebarMaterial);
+        sidebarPanel.position.set(0, CONFIG.sidebarY, -1);
+        scene.add(sidebarPanel);
+
+        // Sidebar border - subtle glow
+        const borderGeometry = new THREE.EdgesGeometry(sidebarGeometry);
+        const borderMaterial = new THREE.LineBasicMaterial({ color: 0x4488cc, transparent: true, opacity: 0.4 });
+        const sidebarBorder = new THREE.LineSegments(borderGeometry, borderMaterial);
+        sidebarBorder.position.copy(sidebarPanel.position);
+        scene.add(sidebarBorder);
+
+        // ============================================
+        // STATE MANAGEMENT
+        // ============================================
+
+        /**
+         * Animation states for the planet
+         * - idle: Planet is at rest, can be dragged
+         * - dragging: Planet is being dragged by user
+         * - snapping: Planet is animating to orbit position
+         * - revolving: Planet is orbiting the sun
+         * - disintegrating: Planet is breaking apart
+         * - resetting: Planet is returning to initial position
+         */
+        const STATE = {
+            IDLE: 'idle',
+            DRAGGING: 'dragging',
+            SNAPPING: 'snapping',
+            REVOLVING: 'revolving',
+            DISINTEGRATING: 'disintegrating',
+            RESETTING: 'resetting'
+        };
+
+        let currentState = STATE.IDLE;
+        let planet = null;  // Currently selected/dragged planet
+        let planetBoundingBox = new THREE.Box3();
+
+        // All available planets
+        const planets = [];
+
+        // Planet data with correct orbit index (0-8 for Mercury-Pluto)
+        // All 9 planets including dummy spheres for missing ones
+        const planetData = [
+            { name: 'Mercury', texture: './mercury/textures/mercurius_diffuse.png', scale: 0.3, orbitIndex: 0 },
+            { name: 'Venus', texture: './venus/textures/moon_baseColor.jpeg', scale: 0.38, orbitIndex: 1 },
+            { name: 'Earth', texture: './earth/textures/Material.001_baseColor.png', scale: 0.4, orbitIndex: 2 },
+            { name: 'Mars', color: 0xcc4422, scale: 0.35, orbitIndex: 3, isDummy: true },
+            { name: 'Jupiter', texture: './planet_gltf/textures/jupiter_diffuse.jpeg', scale: 0.7, orbitIndex: 4 },
+            { name: 'Saturn', texture: './saturn/textures/Material.002_diffuse.jpeg', scale: 0.6, orbitIndex: 5, hasRings: true, ringTexture: './saturn/textures/ring_diffuse.jpeg' },
+            { name: 'Uranus', color: 0x66cccc, scale: 0.45, orbitIndex: 6, isDummy: true },
+            { name: 'Neptune', texture: './neptune/textures/Planeta_baseColor.jpeg', scale: 0.42, orbitIndex: 7 },
+            { name: 'Pluto', color: 0xaa9988, scale: 0.25, orbitIndex: 8, isDummy: true }
+        ];
+
+        // Calculate horizontal sidebar positions (top of screen)
+        const sidebarY = 10;  // Top position
+        const sidebarSpacing = 3.5;
+        const totalWidth = (planetData.length - 1) * sidebarSpacing;
+        const sidebarStartX = -totalWidth / 2;
+        planetData.forEach((data, index) => {
+            data.position = new THREE.Vector3(sidebarStartX + index * sidebarSpacing, sidebarY, 0);
+        });
+
+        // Revolution tracking
+        let revolutionAngle = 0;
+
+        // Animation tracking
+        let animationStartTime = 0;
+        let snapStartPosition = new THREE.Vector3();
+        let snapTargetPosition = new THREE.Vector3();
+
+        // Disintegration particles
+        let particles = [];
+
+        // Completion state - zoom to Earth when all planets placed
+        let allPlanetsPlaced = false;
+        let isZoomingToEarth = false;
+        let earthZoomStartTime = 0;
+        let earthZoomStartPos = new THREE.Vector3();
+        let earthZoomStartLookAt = new THREE.Vector3();
+        const earthZoomDuration = 3000; // 3 seconds zoom
+
+        // ============================================
+        // TEXTURE LOADER
+        // ============================================
+        const textureLoader = new THREE.TextureLoader();
+
+        // ============================================
+        // SUN LOADING
+        // ============================================
+        textureLoader.load(
+            './sun/textures/material_2_baseColor.jpeg',
+            (texture) => {
+                texture.colorSpace = THREE.SRGBColorSpace;
+
+                const sunGeometry = new THREE.SphereGeometry(1.5, 64, 64);
+                const sunMaterial = new THREE.MeshBasicMaterial({
+                    map: texture
+                });
+
+                sun = new THREE.Mesh(sunGeometry, sunMaterial);
+                sun.position.set(0, 0, 0);
+                scene.add(sun);
+
+                // Add glow effect
+                const glowGeometry = new THREE.SphereGeometry(1.7, 32, 32);
+                const glowMaterial = new THREE.MeshBasicMaterial({
+                    color: 0xffaa00,
+                    transparent: true,
+                    opacity: 0.2
+                });
+                const glowMesh = new THREE.Mesh(glowGeometry, glowMaterial);
+                sun.add(glowMesh);
+
+                console.log('Sun loaded successfully');
+            },
+            undefined,
+            (error) => {
+                console.error('Error loading sun texture:', error);
+                // Fallback sun
+                const sunGeometry = new THREE.SphereGeometry(1.5, 32, 32);
+                const sunMaterial = new THREE.MeshBasicMaterial({ color: 0xffdd44 });
+                sun = new THREE.Mesh(sunGeometry, sunMaterial);
+                scene.add(sun);
+            }
+        );
+
+        // ============================================
+        // PLANETS LOADING
+        // ============================================
+
+        /**
+         * Creates a planet with texture or color (for dummy planets)
+         * @param {Object} data - Planet configuration data
+         */
+        function createPlanet(data) {
+            const createPlanetMesh = (material) => {
+                const geometry = new THREE.SphereGeometry(1, 64, 64);
+                const planetMesh = new THREE.Mesh(geometry, material);
+                planetMesh.castShadow = true;
+                planetMesh.receiveShadow = true;
+
+                // Fix Earth texture (mirrored and upside down)
+                if (data.name === 'Earth' && planetMesh.material.map) {
+                    planetMesh.material.map.wrapS = THREE.RepeatWrapping;
+                    planetMesh.material.map.repeat.x = -1;  // Flip horizontally
+                    planetMesh.rotation.x = Math.PI;  // Flip vertically
+                }
+
+                const planetGroup = new THREE.Group();
+                planetGroup.add(planetMesh);
+
+                // Add rings for Saturn
+                if (data.hasRings && data.ringTexture) {
+                    textureLoader.load(data.ringTexture, (ringTexture) => {
+                        ringTexture.colorSpace = THREE.SRGBColorSpace;
+                        const ringGeometry = new THREE.RingGeometry(1.4, 2.2, 64);
+                        const ringMaterial = new THREE.MeshBasicMaterial({
+                            map: ringTexture,
+                            side: THREE.DoubleSide,
+                            transparent: true,
+                            opacity: 0.9
+                        });
+                        const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+                        ring.rotation.x = Math.PI / 2;
+                        planetGroup.add(ring);
+                    });
+                }
+
+                planetGroup.scale.setScalar(data.scale);
+                planetGroup.position.copy(data.position);
+                planetGroup.userData.name = data.name;
+                planetGroup.userData.initialPosition = data.position.clone();
+                planetGroup.userData.initialScale = data.scale;
+                planetGroup.userData.orbitIndex = data.orbitIndex;
+
+                // Start on layer 0 only (ambient lit in sidebar)
+                planetGroup.traverse((child) => {
+                    child.layers.set(0);
+                });
+
+                scene.add(planetGroup);
+                planets.push(planetGroup);
+
+                // Create planet name label
+                createPlanetLabel(data.name, data.position, data.scale);
+
+                console.log(`${data.name} loaded successfully`);
+            };
+
+            if (data.isDummy) {
+                // Create dummy planet with solid color
+                const material = new THREE.MeshStandardMaterial({
+                    color: data.color,
+                    roughness: 0.7,
+                    metalness: 0.1
+                });
+                createPlanetMesh(material);
+            } else {
+                // Load textured planet
+                textureLoader.load(
+                    data.texture,
+                    (texture) => {
+                        texture.colorSpace = THREE.SRGBColorSpace;
+                        const material = new THREE.MeshStandardMaterial({
+                            map: texture,
+                            roughness: 0.8,
+                            metalness: 0.1
+                        });
+                        createPlanetMesh(material);
+                    },
+                    undefined,
+                    (error) => {
+                        console.error(`Error loading ${data.name} texture:`, error);
+                        // Fallback to colored sphere
+                        const material = new THREE.MeshStandardMaterial({
+                            color: 0x888888,
+                            roughness: 0.7
+                        });
+                        createPlanetMesh(material);
+                    }
+                );
+            }
+        }
+
+        // Planet name labels container (HTML overlay)
+        const labelContainer = document.createElement('div');
+        labelContainer.id = 'planet-labels';
+        labelContainer.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:50;';
+        document.body.appendChild(labelContainer);
+
+        // Store label elements for updating
+        const planetLabels = [];
+
+        /**
+         * Creates an HTML label for a planet
+         */
+        function createPlanetLabel(name, position, scale) {
+            const label = document.createElement('div');
+            label.textContent = name;
+            label.style.cssText = `
+                position: absolute;
+                color: #fff;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 11px;
+                text-align: center;
+                text-shadow: 0 0 4px rgba(0,0,0,0.8);
+                white-space: nowrap;
+                transform: translateX(-50%);
+            `;
+            labelContainer.appendChild(label);
+            planetLabels.push({ label, name, offset: scale + 0.5 });
+        }
+
+        /**
+         * Updates label positions based on planet positions
+         */
+        function updateLabels() {
+            // Hide all labels when zooming to Earth
+            if (isZoomingToEarth) {
+                planetLabels.forEach(labelData => {
+                    labelData.label.style.display = 'none';
+                });
+                return;
+            }
+
+            planets.forEach((p, index) => {
+                if (planetLabels[index]) {
+                    const labelData = planetLabels[index];
+                    const pos = p.position.clone();
+                    pos.y -= labelData.offset;  // Below the planet
+
+                    // Project to screen coordinates
+                    pos.project(camera);
+
+                    const x = (pos.x * 0.5 + 0.5) * window.innerWidth;
+                    const y = (1 - (pos.y * 0.5 + 0.5)) * window.innerHeight;
+
+                    labelData.label.style.left = `${x}px`;
+                    labelData.label.style.top = `${y}px`;
+
+                    // Show label only if planet is in sidebar (not orbiting, not being dragged)
+                    const isBeingDragged = (p === planet && currentState === STATE.DRAGGING);
+                    const showLabel = !p.userData.isOrbiting && !isBeingDragged;
+                    labelData.label.style.display = showLabel ? 'block' : 'none';
+                }
+            });
+        }
+
+        // Load all planets
+        planetData.forEach(data => createPlanet(data));
+
+        // ============================================
+        // LAYER MANAGEMENT (for lighting)
+        // ============================================
+        // Layer 0: Ambient light only (sidebar)
+        // Layer 1: Sun light (orbit area)
+
+        /**
+         * Sets a planet to sidebar lighting (ambient only)
+         */
+        function setPlanetToSidebarLighting(p) {
+            p.traverse((child) => {
+                child.layers.set(0);
+            });
+        }
+
+        /**
+         * Sets a planet to orbit lighting (sun + ambient)
+         */
+        function setPlanetToOrbitLighting(p) {
+            p.traverse((child) => {
+                child.layers.enable(0);
+                child.layers.enable(1);
+            });
+        }
+
+        // ============================================
+        // RAYCASTING SETUP (for hand-based interaction)
+        // ============================================
+
+        const raycaster = new THREE.Raycaster();
+        const handPointer = new THREE.Vector2();
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -CONFIG.dragPlaneZ);
+        const intersection = new THREE.Vector3();
+
+        /**
+         * Updates the hand pointer position in normalized device coordinates
+         * @param {number} normalizedX - X position (0-1, left to right)
+         * @param {number} normalizedY - Y position (0-1, top to bottom)
+         */
+        function updateHandPointer(normalizedX, normalizedY) {
+            // Convert from 0-1 range to -1 to 1 range (NDC)
+            // Note: X is mirrored because webcam is mirrored
+            handPointer.x = (1 - normalizedX) * 2 - 1;
+            handPointer.y = -(normalizedY) * 2 + 1;
+        }
+
+        /**
+         * Checks if the hand pointer is over any planet
+         * @returns {THREE.Group|null} The planet being hovered, or null
+         */
+        function getHoveredPlanet() {
+            raycaster.setFromCamera(handPointer, camera);
+
+            for (const p of planets) {
+                // Skip planets that are already orbiting
+                if (p.userData.isOrbiting) continue;
+
+                const intersects = raycaster.intersectObject(p, true);
+                if (intersects.length > 0) {
+                    return p;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Checks if the hand pointer is over the currently selected planet
+         * @returns {boolean} True if pointer intersects planet
+         */
+        function isHandOverPlanet() {
+            if (!planet) {
+                return getHoveredPlanet() !== null;
+            }
+
+            raycaster.setFromCamera(handPointer, camera);
+            const intersects = raycaster.intersectObject(planet, true);
+            return intersects.length > 0;
+        }
+
+        /**
+         * Gets the 3D world position on the drag plane
+         * @returns {THREE.Vector3} World position on drag plane
+         */
+        function getDragPosition() {
+            raycaster.setFromCamera(handPointer, camera);
+            raycaster.ray.intersectPlane(dragPlane, intersection);
+            return intersection;
+        }
+
+        // ============================================
+        // MEDIAPIPE HAND TRACKING
+        // ============================================
+
+        /**
+         * Calculates if the hand is in a closed fist position
+         * by comparing fingertip positions to palm/wrist position
+         *
+         * Hand landmarks:
+         * 0: Wrist
+         * 4: Thumb tip
+         * 8: Index finger tip
+         * 12: Middle finger tip
+         * 16: Ring finger tip
+         * 20: Pinky tip
+         * 9: Middle finger MCP (palm center reference)
+         *
+         * @param {Array} landmarks - Hand landmarks from MediaPipe
+         * @returns {boolean} True if hand is closed (fist)
+         */
+        function isHandClosed(landmarks) {
+            if (!landmarks || landmarks.length < 21) return false;
+
+            const wrist = landmarks[0];
+            const palmCenter = landmarks[9]; // Middle finger MCP
+
+            // Fingertip indices
+            const fingertips = [8, 12, 16, 20]; // Index, Middle, Ring, Pinky
+
+            // Calculate average distance from palm center to wrist (reference distance)
+            const palmSize = Math.sqrt(
+                Math.pow(palmCenter.x - wrist.x, 2) +
+                Math.pow(palmCenter.y - wrist.y, 2)
+            );
+
+            // Calculate average distance from fingertips to palm center
+            let avgFingertipDistance = 0;
+            fingertips.forEach(idx => {
+                const tip = landmarks[idx];
+                const dist = Math.sqrt(
+                    Math.pow(tip.x - palmCenter.x, 2) +
+                    Math.pow(tip.y - palmCenter.y, 2)
+                );
+                avgFingertipDistance += dist;
+            });
+            avgFingertipDistance /= fingertips.length;
+
+            // Ratio of fingertip distance to palm size
+            // Lower ratio = fingers closer to palm = closed fist
+            const ratio = avgFingertipDistance / palmSize;
+
+            // If ratio is below threshold, hand is closed
+            return ratio < CONFIG.handTracking.fistThreshold;
+        }
+
+        /**
+         * Gets the palm center position for cursor positioning
+         * Uses the middle finger MCP as reference point
+         *
+         * @param {Array} landmarks - Hand landmarks from MediaPipe
+         * @returns {Object} Normalized x, y position (0-1)
+         */
+        function getPalmPosition(landmarks) {
+            if (!landmarks || landmarks.length < 21) {
+                return { x: 0.5, y: 0.5 };
+            }
+
+            // Use middle finger MCP (landmark 9) as palm center
+            const palmCenter = landmarks[9];
+            return { x: palmCenter.x, y: palmCenter.y };
+        }
+
+        /**
+         * Processes hand tracking results from MediaPipe
+         * @param {Object} results - MediaPipe Hands results
+         */
+        function onHandResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                // Get the first detected hand
+                const landmarks = results.multiHandLandmarks[0];
+
+                // Get palm position
+                rawHandPosition = getPalmPosition(landmarks);
+
+                // Apply smoothing to reduce jitter
+                smoothedHandPosition.x += (rawHandPosition.x - smoothedHandPosition.x) *
+                    (1 - CONFIG.handTracking.positionSmoothing);
+                smoothedHandPosition.y += (rawHandPosition.y - smoothedHandPosition.y) *
+                    (1 - CONFIG.handTracking.positionSmoothing);
+
+                // Determine gesture
+                previousGesture = currentGesture;
+                currentGesture = isHandClosed(landmarks) ? GESTURE.CLOSED_FIST : GESTURE.OPEN_PALM;
+
+                // Update UI
+                updateHandCursor();
+                updateGestureIndicator();
+
+                // Handle gesture-based interactions
+                handleGestureInput();
+            } else {
+                // No hand detected
+                previousGesture = currentGesture;
+                currentGesture = GESTURE.NO_HAND;
+                updateHandCursor();
+                updateGestureIndicator();
+            }
+        }
+
+        /**
+         * Updates the visual hand cursor position and style
+         */
+        function updateHandCursor() {
+            // Update cursor position (mirrored X for natural feel)
+            const screenX = (1 - smoothedHandPosition.x) * window.innerWidth;
+            const screenY = smoothedHandPosition.y * window.innerHeight;
+
+            handCursor.style.left = `${screenX}px`;
+            handCursor.style.top = `${screenY}px`;
+
+            // Update cursor style based on gesture
+            handCursor.className = '';
+            switch (currentGesture) {
+                case GESTURE.OPEN_PALM:
+                    handCursor.classList.add('open');
+                    break;
+                case GESTURE.CLOSED_FIST:
+                    handCursor.classList.add('closed');
+                    break;
+                default:
+                    handCursor.classList.add('no-hand');
+            }
+        }
+
+        /**
+         * Updates the gesture indicator text
+         */
+        function updateGestureIndicator() {
+            switch (currentGesture) {
+                case GESTURE.OPEN_PALM:
+                    if (currentState === STATE.IDLE) {
+                        const hovered = getHoveredPlanet();
+                        if (hovered) {
+                            const name = hovered.userData.name || 'planet';
+                            const targetOrbit = CONFIG.orbitNames[hovered.userData.orbitIndex];
+                            gestureIndicator.textContent = `✋ Grab ${name} → Orbit ${hovered.userData.orbitIndex + 1}`;
+                        } else {
+                            gestureIndicator.textContent = '✋ Move hand to a planet';
+                        }
+                    } else {
+                        gestureIndicator.textContent = '✋ Open palm - Released';
+                    }
+                    break;
+                case GESTURE.CLOSED_FIST:
+                    if (currentState === STATE.DRAGGING && planet) {
+                        const name = planet.userData.name || 'planet';
+                        const targetOrbit = planet.userData.orbitIndex + 1;
+                        gestureIndicator.textContent = `✊ ${name} → Place in orbit ${targetOrbit}`;
+                    } else {
+                        gestureIndicator.textContent = '✊ Fist detected';
+                    }
+                    break;
+                default:
+                    gestureIndicator.textContent = 'Show your hand to start';
+            }
+        }
+
+        /**
+         * Handles gesture-based planet interaction
+         * - Transition from OPEN to CLOSED while over planet: Start dragging
+         * - Stay CLOSED while dragging: Continue dragging
+         * - Transition from CLOSED to OPEN while dragging: Release
+         */
+        function handleGestureInput() {
+            // Update hand pointer for raycasting
+            updateHandPointer(smoothedHandPosition.x, smoothedHandPosition.y);
+
+            // State machine for gesture handling
+            switch (currentState) {
+                case STATE.IDLE:
+                    // Check for grab gesture (transition to closed fist while over a planet)
+                    if (currentGesture === GESTURE.CLOSED_FIST &&
+                        previousGesture === GESTURE.OPEN_PALM) {
+                        const hoveredPlanet = getHoveredPlanet();
+                        if (hoveredPlanet) {
+                            // Select this planet and start dragging
+                            planet = hoveredPlanet;
+                            currentState = STATE.DRAGGING;
+                            justGrabbedPlanet = true;
+
+                            // Switch to orbit lighting (sun lit)
+                            setPlanetToOrbitLighting(planet);
+                        }
+                    }
+                    break;
+
+                case STATE.DRAGGING:
+                    if (currentGesture === GESTURE.CLOSED_FIST && planet) {
+                        // Continue dragging - move planet to hand position
+                        const pos = getDragPosition();
+                        planet.position.lerp(pos, 0.3);
+
+                        // Highlight nearest orbit
+                        highlightNearestOrbit();
+                    } else if (currentGesture === GESTURE.OPEN_PALM) {
+                        // Released - check orbit placement
+                        checkOrbitPlacement();
+                    } else if (currentGesture === GESTURE.NO_HAND) {
+                        // Hand lost - return planet to sidebar and idle
+                        if (planet) {
+                            planet.position.copy(planet.userData.initialPosition);
+                            setPlanetToSidebarLighting(planet);
+                        }
+                        currentState = STATE.IDLE;
+                        planet = null;
+                        resetOrbitHighlights();
+                    }
+                    break;
+            }
+
+            justGrabbedPlanet = false;
+        }
+
+        /**
+         * Initialize MediaPipe Hands
+         */
+        async function initHandTracking() {
+            const hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+                }
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: CONFIG.handTracking.minDetectionConfidence,
+                minTrackingConfidence: CONFIG.handTracking.minTrackingConfidence
+            });
+
+            hands.onResults(onHandResults);
+
+            // Set up camera
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+
+            await camera.start();
+
+            // Hide loading overlay
+            loadingOverlay.classList.add('hidden');
+            console.log('Hand tracking initialized');
+        }
+
+        // Start hand tracking
+        initHandTracking().catch(err => {
+            console.error('Failed to initialize hand tracking:', err);
+            loadingOverlay.innerHTML = `
+                <div style="color: #f44; text-align: center;">
+                    <p>Failed to initialize hand tracking</p>
+                    <p style="font-size: 14px; margin-top: 10px;">${err.message}</p>
+                    <p style="font-size: 12px; margin-top: 20px; color: #888;">
+                        Make sure camera access is allowed
+                    </p>
+                </div>
+            `;
+        });
+
+        // Ensure video plays (some browsers block autoplay)
+        document.addEventListener('click', () => {
+            video.play().catch(() => {});
+        }, { once: true });
+
+        // ============================================
+        // ORBIT DETECTION
+        // ============================================
+
+        /**
+         * Gets the distance from planet to center in XZ plane
+         * @returns {number} Distance from center
+         */
+        function getPlanetDistanceFromCenter() {
+            if (!planet) return 0;
+            return Math.sqrt(planet.position.x ** 2 + planet.position.z ** 2);
+        }
+
+        /**
+         * Finds the nearest orbit to the planet's current position
+         * @returns {Object|null} { index, radius, distance } or null if none close
+         */
+        function findNearestOrbit() {
+            if (!planet) return null;
+
+            const distFromCenter = getPlanetDistanceFromCenter();
+            let nearest = null;
+            let minDist = Infinity;
+
+            CONFIG.orbitRadii.forEach((radius, index) => {
+                const dist = Math.abs(distFromCenter - radius);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = { index, radius, distance: dist };
+                }
+            });
+
+            return nearest;
+        }
+
+        /**
+         * Highlights the nearest orbit while dragging
+         * Shows green if correct orbit, red if wrong orbit
+         */
+        function highlightNearestOrbit() {
+            if (!planet) return;
+
+            const nearest = findNearestOrbit();
+            const correctOrbitIndex = planet.userData.orbitIndex;
+
+            // Reset all orbits to default
+            orbitRings.forEach(ring => {
+                ring.material.opacity = ring.userData.defaultOpacity;
+                ring.material.color.setHex(0x4488aa);
+            });
+
+            // Highlight nearest orbit if within threshold
+            if (nearest && nearest.distance < CONFIG.orbitSnapThreshold) {
+                const ring = orbitRings[nearest.index];
+                ring.material.opacity = 0.9;
+
+                // Green if correct, red if wrong
+                if (nearest.index === correctOrbitIndex) {
+                    ring.material.color.setHex(0x00ff00);
+                } else {
+                    ring.material.color.setHex(0xff4444);
+                }
+            }
+        }
+
+        /**
+         * Resets all orbit highlights to default
+         */
+        function resetOrbitHighlights() {
+            orbitRings.forEach(ring => {
+                ring.material.opacity = ring.userData.defaultOpacity;
+                ring.material.color.setHex(0x4488aa);
+            });
+        }
+
+        /**
+         * Determines which orbit the planet was placed on
+         * Triggers appropriate animation based on placement
+         */
+        function checkOrbitPlacement() {
+            if (!planet) {
+                currentState = STATE.IDLE;
+                return;
+            }
+
+            const nearest = findNearestOrbit();
+            const correctOrbitIndex = planet.userData.orbitIndex;
+
+            if (nearest && nearest.distance < CONFIG.orbitSnapThreshold) {
+                if (nearest.index === correctOrbitIndex) {
+                    // Correct placement - snap to orbit and start revolving
+                    startSnapAnimation(nearest.radius, nearest.index, true);
+                } else {
+                    // Wrong orbit - snap then disintegrate
+                    startSnapAnimation(nearest.radius, nearest.index, false);
+                }
+            } else {
+                // Not near any orbit - return planet to sidebar
+                if (planet) {
+                    planet.position.copy(planet.userData.initialPosition);
+                    setPlanetToSidebarLighting(planet);
+                }
+                currentState = STATE.IDLE;
+                planet = null;
+            }
+
+            resetOrbitHighlights();
+        }
+
+        // ============================================
+        // SNAP ANIMATION
+        // ============================================
+
+        /**
+         * Initiates snap animation to orbit
+         * @param {number} orbitRadius - Target orbit radius
+         * @param {number} orbitIndex - Index of the target orbit
+         * @param {boolean} isCorrect - Whether this is the correct orbit
+         */
+        function startSnapAnimation(orbitRadius, orbitIndex, isCorrect) {
+            currentState = STATE.SNAPPING;
+            animationStartTime = performance.now();
+
+            // Store start position
+            snapStartPosition.copy(planet.position);
+
+            // Calculate target position on orbit
+            // Use current angle from center
+            const angle = Math.atan2(planet.position.z, planet.position.x);
+            snapTargetPosition.set(
+                Math.cos(angle) * orbitRadius,
+                0,
+                Math.sin(angle) * orbitRadius
+            );
+
+            // Store orbit info for callback
+            planet.userData.isCorrectOrbit = isCorrect;
+            planet.userData.targetRadius = orbitRadius;
+            planet.userData.targetOrbitIndex = orbitIndex;
+
+            // Set revolution angle for later
+            revolutionAngle = angle;
+        }
+
+        /**
+         * Updates snap animation each frame
+         * @param {number} currentTime - Current timestamp
+         */
+        function updateSnapAnimation(currentTime) {
+            const elapsed = currentTime - animationStartTime;
+            const duration = 500; // 500ms snap duration
+
+            // Ease out cubic
+            let t = Math.min(elapsed / duration, 1);
+            t = 1 - Math.pow(1 - t, 3);
+
+            // Interpolate position
+            planet.position.lerpVectors(snapStartPosition, snapTargetPosition, t);
+
+            if (t >= 1) {
+                // Snap complete
+                if (planet.userData.isCorrectOrbit) {
+                    // Mark as orbiting so it can't be grabbed again
+                    planet.userData.isOrbiting = true;
+                    planet.userData.orbitRadius = planet.userData.targetRadius;
+                    planet.userData.orbitAngle = revolutionAngle;
+                    planet.userData.orbitSpeed = CONFIG.orbitSpeeds[planet.userData.targetOrbitIndex];
+                    currentState = STATE.IDLE;
+                    planet = null;  // Deselect planet
+
+                    // Check if all planets are now placed
+                    checkAllPlanetsPlaced();
+                } else {
+                    startDisintegration();
+                }
+            }
+        }
+
+        // ============================================
+        // REVOLUTION ANIMATION (Correct Placement)
+        // ============================================
+
+        /**
+         * Updates revolution animation for all orbiting planets
+         * Time-based rotation around the sun
+         * @param {number} deltaTime - Time since last frame in seconds
+         */
+        function updateAllOrbits(deltaTime) {
+            planets.forEach(p => {
+                if (p.userData.isOrbiting) {
+                    // Update angle based on planet's specific speed
+                    const speed = p.userData.orbitSpeed || CONFIG.orbitSpeeds[0];
+                    p.userData.orbitAngle += speed * deltaTime;
+
+                    // Calculate new position
+                    const radius = p.userData.orbitRadius;
+                    p.position.x = Math.cos(p.userData.orbitAngle) * radius;
+                    p.position.z = Math.sin(p.userData.orbitAngle) * radius;
+
+                    // Rotate planet on its own axis (faster for Earth zoom effect)
+                    const rotationSpeed = isZoomingToEarth && p.userData.name === 'Earth' ? 2.0 : 0.5;
+                    p.rotation.y += deltaTime * rotationSpeed;
+                }
+            });
+        }
+
+        /**
+         * Checks if all planets are placed in their correct orbits
+         */
+        function checkAllPlanetsPlaced() {
+            if (allPlanetsPlaced) return true;
+
+            const totalPlanets = planetData.length;
+            const orbitingPlanets = planets.filter(p => p.userData.isOrbiting).length;
+
+            if (orbitingPlanets === totalPlanets) {
+                allPlanetsPlaced = true;
+                startEarthZoom();
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Gets the Earth planet object
+         */
+        function getEarthPlanet() {
+            return planets.find(p => p.userData.name === 'Earth');
+        }
+
+        /**
+         * Starts the zoom animation to Earth
+         */
+        function startEarthZoom() {
+            isZoomingToEarth = true;
+            earthZoomStartTime = performance.now();
+            earthZoomStartPos.copy(camera.position);
+            earthZoomStartLookAt.copy(initialCameraLookAt);
+
+            // Hide sidebar panel
+            sidebarPanel.visible = false;
+            sidebarBorder.visible = false;
+
+            // Hide hand cursor and video preview
+            handCursor.style.display = 'none';
+            document.getElementById('video-container').style.display = 'none';
+
+            // Update gesture indicator with celebration
+            gestureIndicator.style.fontSize = '20px';
+            gestureIndicator.style.padding = '15px 30px';
+            gestureIndicator.textContent = '🎉 All planets placed! Zooming to Earth...';
+
+            console.log('All planets placed! Zooming to Earth...');
+        }
+
+        /**
+         * Updates the Earth zoom animation
+         * @param {number} currentTime - Current timestamp
+         */
+        function updateEarthZoom(currentTime) {
+            if (!isZoomingToEarth) return;
+
+            const earth = getEarthPlanet();
+            if (!earth) return;
+
+            const elapsed = currentTime - earthZoomStartTime;
+            let t = Math.min(elapsed / earthZoomDuration, 1);
+
+            // Smooth easing
+            t = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+            // Calculate target position (closer to Earth, slightly above)
+            const earthPos = earth.position.clone();
+            const targetCameraPos = new THREE.Vector3(
+                earthPos.x + 3,
+                earthPos.y + 2,
+                earthPos.z + 4
+            );
+
+            // Interpolate camera position
+            camera.position.lerpVectors(earthZoomStartPos, targetCameraPos, t);
+
+            // Look at Earth
+            const lookAtTarget = earthPos.clone();
+            const currentLookAt = new THREE.Vector3().lerpVectors(earthZoomStartLookAt, lookAtTarget, t);
+            camera.lookAt(currentLookAt);
+
+            if (t >= 1) {
+                gestureIndicator.textContent = '🌍 Earth - Our Home Planet';
+            }
+        }
+
+        // ============================================
+        // DISINTEGRATION ANIMATION (Incorrect Placement)
+        // ============================================
+
+        /**
+         * Initializes disintegration effect
+         * Creates particles that spread outward
+         */
+        function startDisintegration() {
+            currentState = STATE.DISINTEGRATING;
+            animationStartTime = performance.now();
+
+            // Store original properties for reset (use stored initial position)
+            planet.userData.originalScale = planet.scale.clone();
+            // initialPosition was stored when planet was created
+
+            // Store original material properties and make materials transparent-ready
+            planet.userData.originalMaterials = [];
+            planet.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    const materials = Array.isArray(child.material)
+                        ? child.material
+                        : [child.material];
+
+                    materials.forEach((mat, idx) => {
+                        // Store original state
+                        planet.userData.originalMaterials.push({
+                            mesh: child,
+                            index: idx,
+                            transparent: mat.transparent,
+                            opacity: mat.opacity,
+                            depthWrite: mat.depthWrite
+                        });
+
+                        // Prepare for fading
+                        mat.transparent = true;
+                        mat.depthWrite = false;
+                        mat.needsUpdate = true;
+                    });
+                }
+            });
+
+            // Create particle effect
+            createDisintegrationParticles();
+        }
+
+        /**
+         * Creates particles for disintegration effect
+         */
+        function createDisintegrationParticles() {
+            const geometry = new THREE.SphereGeometry(0.1, 8, 8);
+
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                const material = new THREE.MeshBasicMaterial({
+                    color: new THREE.Color().setHSL(Math.random() * 0.1 + 0.05, 0.8, 0.5),
+                    transparent: true,
+                    opacity: 1
+                });
+
+                const particle = new THREE.Mesh(geometry, material);
+                particle.position.copy(planet.position);
+
+                // Random velocity direction
+                particle.userData.velocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 4,
+                    (Math.random() - 0.5) * 4,
+                    (Math.random() - 0.5) * 4
+                );
+
+                scene.add(particle);
+                particles.push(particle);
+            }
+        }
+
+        /**
+         * Updates disintegration animation
+         * @param {number} currentTime - Current timestamp
+         * @param {number} deltaTime - Time since last frame
+         */
+        function updateDisintegration(currentTime, deltaTime) {
+            const elapsed = currentTime - animationStartTime;
+            const progress = Math.min(elapsed / CONFIG.disintegrationDuration, 1);
+
+            // Scale down and fade planet
+            if (planet) {
+                const scale = 1 - progress;
+                planet.scale.setScalar(scale * planet.userData.originalScale.x);
+
+                // Fade planet materials
+                planet.traverse((child) => {
+                    if (child.isMesh && child.material) {
+                        const materials = Array.isArray(child.material)
+                            ? child.material
+                            : [child.material];
+                        materials.forEach((mat) => {
+                            mat.opacity = 1 - progress;
+                        });
+                    }
+                });
+            }
+
+            // Update particles
+            particles.forEach((particle) => {
+                particle.position.add(
+                    particle.userData.velocity.clone().multiplyScalar(deltaTime)
+                );
+                particle.material.opacity = 1 - progress;
+                particle.scale.setScalar(1 - progress * 0.5);
+            });
+
+            if (progress >= 1) {
+                // Clean up particles
+                particles.forEach((p) => {
+                    scene.remove(p);
+                    p.geometry.dispose();
+                    p.material.dispose();
+                });
+                particles = [];
+
+                // Start reset
+                startReset();
+            }
+        }
+
+        // ============================================
+        // RESET ANIMATION
+        // ============================================
+
+        /**
+         * Initiates reset animation back to starting position
+         */
+        function startReset() {
+            currentState = STATE.RESETTING;
+            animationStartTime = performance.now();
+
+            // Reset planet visibility but keep at small scale
+            planet.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    const materials = Array.isArray(child.material)
+                        ? child.material
+                        : [child.material];
+                    materials.forEach((mat) => {
+                        mat.opacity = 0;
+                    });
+                }
+            });
+            planet.scale.setScalar(0.01);
+            // Use the planet's stored initial position
+            planet.position.copy(planet.userData.initialPosition);
+        }
+
+        /**
+         * Updates reset animation
+         * @param {number} currentTime - Current timestamp
+         */
+        function updateReset(currentTime) {
+            const elapsed = currentTime - animationStartTime;
+            const duration = 800;
+
+            // Ease out elastic-like
+            let t = Math.min(elapsed / duration, 1);
+            t = 1 - Math.pow(1 - t, 3);
+
+            // Scale up - use stored initial scale
+            const targetScale = planet.userData.initialScale || planet.userData.originalScale.x;
+            planet.scale.setScalar(t * targetScale);
+
+            // Fade in
+            planet.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    const materials = Array.isArray(child.material)
+                        ? child.material
+                        : [child.material];
+                    materials.forEach((mat) => {
+                        mat.opacity = t;
+                    });
+                }
+            });
+
+            if (t >= 1) {
+                // Reset complete - return to idle
+                currentState = STATE.IDLE;
+
+                // Restore original material properties
+                if (planet.userData.originalMaterials) {
+                    planet.userData.originalMaterials.forEach((orig) => {
+                        const materials = Array.isArray(orig.mesh.material)
+                            ? orig.mesh.material
+                            : [orig.mesh.material];
+                        const mat = materials[orig.index];
+                        if (mat) {
+                            mat.transparent = orig.transparent;
+                            mat.opacity = orig.opacity;
+                            mat.depthWrite = orig.depthWrite;
+                            mat.needsUpdate = true;
+                        }
+                    });
+                    planet.userData.originalMaterials = null;
+                }
+
+                // Switch back to sidebar lighting (ambient only)
+                setPlanetToSidebarLighting(planet);
+
+                // Deselect the planet
+                planet = null;
+            }
+        }
+
+        // ============================================
+        // ANIMATION LOOP
+        // ============================================
+
+        let lastTime = performance.now();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const currentTime = performance.now();
+            const deltaTime = (currentTime - lastTime) / 1000; // Convert to seconds
+            lastTime = currentTime;
+
+            // State-based animation updates
+            switch (currentState) {
+                case STATE.SNAPPING:
+                    updateSnapAnimation(currentTime);
+                    break;
+
+                case STATE.DISINTEGRATING:
+                    updateDisintegration(currentTime, deltaTime);
+                    break;
+
+                case STATE.RESETTING:
+                    updateReset(currentTime);
+                    break;
+            }
+
+            // Update all orbiting planets
+            updateAllOrbits(deltaTime);
+
+            // Update Earth zoom animation
+            if (isZoomingToEarth) {
+                updateEarthZoom(currentTime);
+
+                // After zoom complete, follow Earth
+                const earth = getEarthPlanet();
+                if (earth && (currentTime - earthZoomStartTime) > earthZoomDuration) {
+                    const earthPos = earth.position.clone();
+                    const targetCameraPos = new THREE.Vector3(
+                        earthPos.x + 3,
+                        earthPos.y + 2,
+                        earthPos.z + 4
+                    );
+                    camera.position.lerp(targetCameraPos, 0.05);
+                    camera.lookAt(earthPos);
+                }
+            }
+
+            // Rotate sun for visual effect
+            if (sun) {
+                sun.rotation.y += deltaTime * 0.1;
+            }
+
+            // Update planet name labels
+            updateLabels();
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // ============================================
+        // WINDOW RESIZE HANDLER
+        // ============================================
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
